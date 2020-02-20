@@ -1,0 +1,13 @@
+[package]
+name = "f-pacs"
+version = "0.1.0"
+authors = ["shumy <micaelpedrosa@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+curve25519-dalek = { version = "1", features = ["serde"] }
+base64 = "0.11"
+sha2 = "0.8"
+rand_os = "0.1"
+clear_on_drop = "0.2"
