@@ -6,7 +6,7 @@ use clear_on_drop::clear::Clear;
 
 use serde::{Serialize, Deserialize};
 
-use curve25519_dalek::ristretto::{RistrettoPoint};
+use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 
 use crate::crypto::KeyEncoder;
@@ -299,7 +299,7 @@ impl Reconstruct<Share> for Polynomial {
                 acc[j] += num[j] * barycentric * item.yi;
             }
         }
-
+        
         cut_tail(&mut acc, Scalar::zero());
         Polynomial { a: acc }
     }

@@ -21,20 +21,19 @@ struct SerializedSignature {
 
 #[derive(Clone)]
 pub struct Signature {
-    pub encoded: String,
     pub c: Scalar,
     pub p: Scalar
 }
 
 impl Debug for Signature {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> std::fmt::Result {
-        fmt.write_str(&self.encoded)
+        fmt.write_str(&self.encode())
     }
 }
 
 impl Serialize for Signature {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
-        let ss = SerializedSignature { sig: self.encoded.clone() };
+        let ss = SerializedSignature { sig: self.encode() };
         ss.serialize(serializer)
     }
 }
@@ -56,58 +55,51 @@ impl<'de> Deserialize<'de> for Signature {
         let mut p_bytes: [u8; 32] = Default::default();
         p_bytes.copy_from_slice(&data[32..64]);
 
-        let c_scalar = Scalar::from_canonical_bytes(c_bytes)
+        let c = Scalar::from_canonical_bytes(c_bytes)
             .ok_or_else(|| Error::custom("Invalid c scalar!"))?;
         
-        let p_scalar = Scalar::from_canonical_bytes(p_bytes)
+        let p = Scalar::from_canonical_bytes(p_bytes)
             .ok_or_else(|| Error::custom("Invalid p scalar!"))?;
 
-        let obj = Signature { encoded: ss.sig, c: c_scalar, p: p_scalar };
-        Ok(obj)
+        Ok(Signature { c, p })
     }
 }
 
 impl Signature {
+    fn encode(&self) -> String {
+        let data: &[&[u8]] = &[self.c.as_bytes(), self.p.as_bytes()];
+        let data = data.concat();
+        base64::encode(&data)
+    }
+
     #[allow(non_snake_case)]
-    pub fn sign(s: &Scalar, key: &RistrettoPoint, data: &[Vec<u8>]) -> Self {
-        let mut hasher = Sha512::new()
-            .chain(s.as_bytes());
-        
-        for d in data {
-            hasher.input(d);
-        }
+    pub fn sign(s: &Scalar, key: &RistrettoPoint, dhash: &[u8]) -> Self {
+        let hasher = Sha512::new()
+            .chain(s.as_bytes())
+            .chain(dhash);
 
         let m = Scalar::from_hash(hasher); 
         let M = (m * G).compress();
 
-        let mut hasher = Sha512::new()
+        let hasher = Sha512::new()
             .chain(key.compress().as_bytes())
-            .chain(M.as_bytes());
-        
-        for d in data {
-            hasher.input(d);
-        }
+            .chain(M.as_bytes())
+            .chain(dhash);
 
         let c = Scalar::from_hash(hasher);
         let p = m - c * s;
 
-        let data: &[&[u8]] = &[c.as_bytes(), p.as_bytes()];
-        let data = data.concat();
-
-        Self { encoded: base64::encode(&data), c, p }
+        Self { c, p }
     }
 
     #[allow(non_snake_case)]
-    pub fn verify(&self, key: &RistrettoPoint, data: &[Vec<u8>]) -> bool {
+    pub fn verify(&self, key: &RistrettoPoint, dhash: &[u8]) -> bool {
         let M = self.c * key + self.p * G;
 
-        let mut hasher = Sha512::new()
+        let hasher = Sha512::new()
             .chain(key.compress().as_bytes())
-            .chain(M.compress().as_bytes());
-        
-        for d in data {
-            hasher.input(d);
-        }
+            .chain(M.compress().as_bytes())
+            .chain(dhash);
         
         let c = Scalar::from_hash(hasher);
 
@@ -134,19 +126,15 @@ impl Debug for ExtSignature {
 }
 
 impl ExtSignature {
-    pub fn id(&self) -> &str {
-        &self.sig.encoded
-    }
-
     #[allow(non_snake_case)]
-    pub fn sign(s: &Scalar, key: RistrettoPoint, data: &[Vec<u8>]) -> Self {
-        let sig = Signature::sign(s, &key, data);
+    pub fn sign(s: &Scalar, key: RistrettoPoint, dhash: &[u8]) -> Self {
+        let sig = Signature::sign(s, &key, dhash);
         Self { sig, key }
     }
 
     #[allow(non_snake_case)]
-    pub fn verify(&self, data: &[Vec<u8>]) -> bool {
-        self.sig.verify(&self.key, data)
+    pub fn verify(&self, dhash: &[u8]) -> bool {
+        self.sig.verify(&self.key, dhash)
     }
 }
 
@@ -164,10 +152,13 @@ mod tests {
         let d0 = rnd_scalar();
         let d1 = rnd_scalar();
 
-        let data = &[d0.to_bytes().to_vec(), d1.to_bytes().to_vec()];
-        let sig = ExtSignature::sign(&a, Pa, data);
-        
-        assert!(sig.verify(data) == true);
+        let dhash = Sha512::new()
+            .chain(d0.as_bytes())
+            .chain(d1.as_bytes())
+            .result();
+
+        let sig = ExtSignature::sign(&a, Pa, dhash.as_slice());
+        assert!(sig.verify(dhash.as_slice()) == true);
     }
 
     #[allow(non_snake_case)]
@@ -180,10 +171,18 @@ mod tests {
         let d1 = rnd_scalar();
         let d2 = rnd_scalar();
         
-        let data1 = &[d0.to_bytes().to_vec(), d1.to_bytes().to_vec()];
-        let sig = ExtSignature::sign(&a, Pa, data1);
+        let dhash1 = Sha512::new()
+            .chain(d0.as_bytes())
+            .chain(d1.as_bytes())
+            .result();
+
+        let sig = ExtSignature::sign(&a, Pa, dhash1.as_slice());
         
-        let data2 = &[d0.to_bytes().to_vec(), d2.to_bytes().to_vec()];
-        assert!(sig.verify(data2) == false);
+        let dhash2 = Sha512::new()
+            .chain(d0.as_bytes())
+            .chain(d2.as_bytes())
+            .result();
+        
+        assert!(sig.verify(dhash2.as_slice()) == false);
     }
 }

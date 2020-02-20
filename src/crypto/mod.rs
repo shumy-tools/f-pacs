@@ -16,6 +16,18 @@ pub fn rnd_scalar() -> Scalar {
     Scalar::random(&mut csprng)
 }
 
+pub struct KeyPair {
+    pub s: Scalar,
+    pub key: RistrettoPoint
+}
+
+impl KeyPair {
+    pub fn new() -> Self {
+        let s = rnd_scalar();
+        Self { s, key: s * &G }
+    }
+}
+
 
 pub trait KeyEncoder {
     fn encode(&self) -> String;
@@ -24,7 +36,6 @@ pub trait KeyEncoder {
 pub trait HardKeyDecoder<T> {
     fn decode(&self) -> T;
 }
-
 
 impl KeyEncoder for CompressedRistretto {
     fn encode(&self) -> String {
