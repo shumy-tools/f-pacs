@@ -3,6 +3,7 @@
 
 use sha2::{Sha512, Digest};
 use serde::{Serialize, Deserialize};
+
 use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
 
 use std::io::{Read, Write, Cursor};
@@ -49,6 +50,10 @@ impl RnChain {
 
     pub fn set(&self) -> &str {
         self.chain.first().unwrap().set.as_ref().unwrap()
+    }
+
+    pub fn kn(&self) -> &RistrettoPoint {
+        &self.chain.last().unwrap().data.kn
     }
 
     pub fn new(head: Rn) -> Result<Self> {
@@ -107,7 +112,7 @@ pub struct RnEncData {
 }
 
 impl RnEncData {
-    fn new(ekey: &RistrettoPoint, id: &str, set: &str, cd: &RnData) -> Result<Self> {
+    fn new(ekey: &RistrettoPoint, id: &str, set: &str, cd: &RnData) -> (Vec<u8>, Self) {
         let k = rnd_scalar();
         let alpha = (k * ekey).compress();
         let lambda = lambda(&alpha, id, set);
@@ -116,12 +121,12 @@ impl RnEncData {
         let mut data = Vec::new();
         {
             let encryptor = AesSafe128Encryptor::new(&lambda[..16]);
-            let mut writer = AesWriter::new(&mut data, encryptor)?;
-            let b_cd = bincode::serialize(cd)?;
-            writer.write_all(&b_cd)?;
+            let mut writer = AesWriter::new(&mut data, encryptor).unwrap();
+            let b_cd = bincode::serialize(cd).unwrap();
+            writer.write_all(&b_cd).unwrap();
         }
 
-        Ok(Self { kn: (k * &G), data })
+        (lambda, Self { kn: (k * &G), data })
     }
 
     fn data(&self, lambda: &[u8]) -> Result<RnData> {
@@ -161,8 +166,8 @@ impl Rn {
         &self.sig.key
     }
 
-    pub fn head(keyp: &KeyPair, ekey: &RistrettoPoint, id: &str, set: &str, rd: RnData) -> Self {
-        let data = RnEncData::new(ekey, id, set, &rd).unwrap();
+    pub fn head(keyp: &KeyPair, ekey: &RistrettoPoint, id: &str, set: &str, rd: RnData) -> (Vec<u8>, Self) {
+        let (lambda, data) = RnEncData::new(ekey, id, set, &rd);
         let dhash = Sha512::new()
             .chain(id)
             .chain(set)
@@ -170,20 +175,18 @@ impl Rn {
             .result();
 
         let sig = ExtSignature::sign(&keyp.s, keyp.key.clone(), dhash.as_slice());
-
-        Self { id: Some(id.into()), set: Some(set.into()), hprev: None, data, sig }
+        (lambda, Self { id: Some(id.into()), set: Some(set.into()), hprev: None, data, sig })
     }
 
-    pub fn tail(keyp: &KeyPair, ekey: &RistrettoPoint, hprev: &[u8], id: &str, set: &str, rd: RnData) -> Self {
-        let data = RnEncData::new(ekey, id, set, &rd).unwrap();
+    pub fn tail(keyp: &KeyPair, ekey: &RistrettoPoint, hprev: &[u8], id: &str, set: &str, rd: RnData) -> (Vec<u8>, Self) {
+        let (lambda, data) = RnEncData::new(ekey, id, set, &rd);
         let dhash = Sha512::new()
             .chain(hprev)
             .chain(data.to_vec())
             .result();
 
         let sig = ExtSignature::sign(&keyp.s, keyp.key.clone(), dhash.as_slice());
-
-        Self { id: None, set: None, hprev: Some(hprev.into()), data, sig }
+        (lambda, Self { id: None, set: None, hprev: Some(hprev.into()), data, sig })
     }
 
     pub fn check(&self) -> Result<Vec<u8>> {
@@ -289,7 +292,7 @@ mod tests {
         let set = "dataset-id";
 
         let cd1 = RnData { lambda_prev: None, file: RnFileRef { dn: *b"encryption123456", hfile: b"file-url".to_vec() } };
-        let r1 = Rn::head(&skp, &ekp.key, id, set, cd1.clone());
+        let (_, r1) = Rn::head(&skp, &ekp.key, id, set, cd1.clone());
         assert!(r1.check().is_ok());
 
         let alpha = (ekp.s * &r1.data.kn).compress();
@@ -307,25 +310,22 @@ mod tests {
         let set = "dataset-id";
 
             let rd = RnData { lambda_prev: None, file: RnFileRef { dn: *b"encryption123456", hfile: b"file-1-url".to_vec() } };
-            let r = Rn::head(&skp, &ekp.key, id, set, rd);
-            let alpha = (ekp.s * &r.data.kn).compress();
+            let (lamb, r) = Rn::head(&skp, &ekp.key, id, set, rd);
         
         let mut chain = RnChain::new(r).unwrap();
-        
-            let lamb = lambda(&alpha, id, set);
+
             let rd = RnData { lambda_prev: Some(lamb), file: RnFileRef { dn: *b"encryption654321", hfile: b"file-2-url".to_vec() } };
-            let r = Rn::tail(&skp, &ekp.key, &chain.lhash, id, set, rd);
-            let alpha = (ekp.s * &r.data.kn).compress();
+            let (lamb, r) = Rn::tail(&skp, &ekp.key, &chain.lhash, id, set, rd);
 
         chain.push(r).unwrap();
 
-            let lamb = lambda(&alpha, id, set);
             let rd = RnData { lambda_prev: Some(lamb), file: RnFileRef { dn: *b"encryption564321", hfile: b"file-3-url".to_vec() } };
-            let r = Rn::tail(&skp, &ekp.key, &chain.lhash, id, set, rd);
-            let alpha = (ekp.s * &r.data.kn).compress();
+            let (_, r) = Rn::tail(&skp, &ekp.key, &chain.lhash, id, set, rd);
 
         chain.push(r).unwrap();
 
+        // recover the original set of RnFileRef
+        let alpha = (ekp.s * chain.kn()).compress();
         let refs = chain.recover(&alpha).unwrap();
 
         let mut res: String = "".into();

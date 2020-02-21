@@ -85,11 +85,51 @@ impl<'a, 'b> Mul<&'b RistrettoPoint> for &'a Share {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ShareVector(pub Vec<Share>);
 
+impl ShareVector {
+    pub fn recover(&self) -> Scalar {
+        let range = self.0.iter().map(|s| Scalar::from(s.i)).collect::<Vec<_>>();
+
+        let mut acc = Scalar::zero();
+        for (i, item) in self.0.iter().enumerate() {
+            acc += Polynomial::l_i(&range, i) * item.yi;
+        }
+
+        acc
+    }
+}
+
 impl Drop for ShareVector {
     fn drop(&mut self) {
         for item in self.0.iter_mut() {
             item.yi.clear();
         }
+    }
+}
+
+impl<'a, 'b> Mul<&'b RistrettoPoint> for &'a ShareVector {
+    type Output = RistrettoShareVector;
+    fn mul(self, rhs: &'b RistrettoPoint) -> RistrettoShareVector {
+        let res: Vec<RistrettoShare> = self.0.iter().map(|s| s * rhs).collect();
+        RistrettoShareVector(res)
+    }
+}
+
+//-----------------------------------------------------------------------------------------------------------
+// RistrettoShareVector
+//-----------------------------------------------------------------------------------------------------------
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RistrettoShareVector(pub Vec<RistrettoShare>);
+
+impl RistrettoShareVector {
+    pub fn recover(&self) -> RistrettoPoint {
+        let range = self.0.iter().map(|s| Scalar::from(s.i)).collect::<Vec<_>>();
+
+        let mut acc = RistrettoPoint::default();
+        for (i, item) in self.0.iter().enumerate() {
+            acc += Polynomial::l_i(&range, i) * item.Yi;
+        }
+
+        acc
     }
 }
 
@@ -165,11 +205,6 @@ fn lx_num_bar(range: &[Scalar], i: usize) -> (Vec<Scalar>, Scalar) {
     }
 
     (num, denum.invert())
-}
-
-pub trait Interpolate<S> {
-    type Output;
-    fn interpolate(shares: &[S]) -> Self::Output;
 }
 
 pub trait Evaluate {
@@ -266,21 +301,6 @@ impl Evaluate for Polynomial {
     }
 }
 
-impl Interpolate<Share> for Polynomial {
-    type Output = Scalar;
-    
-    fn interpolate(shares: &[Share]) -> Scalar {
-        let range = shares.iter().map(|s| Scalar::from(s.i)).collect::<Vec<_>>();
-
-        let mut acc = Scalar::zero();
-        for (i, item) in shares.iter().enumerate() {
-            acc += Polynomial::l_i(&range, i) * item.yi;
-        }
-
-        acc
-    }
-}
-
 impl Degree for Polynomial {
     fn degree(&self) -> usize {
         self.a.len() - 1
@@ -335,22 +355,6 @@ impl Evaluate for RistrettoPolynomial {
     }
 }
 
-impl Interpolate<RistrettoShare> for RistrettoPolynomial {
-    type Output = RistrettoPoint;
-
-    #[allow(non_snake_case)]
-    fn interpolate(shares: &[RistrettoShare]) -> RistrettoPoint {
-        let range = shares.iter().map(|s| Scalar::from(s.i)).collect::<Vec<_>>();
-
-        let mut acc = RistrettoPoint::default();
-        for (i, item) in shares.iter().enumerate() {
-            acc += Polynomial::l_i(&range, i) * item.Yi;
-        }
-
-        acc
-    }
-}
-
 impl Degree for RistrettoPolynomial {
     fn degree(&self) -> usize {
         self.A.len() - 1
@@ -375,12 +379,12 @@ mod tests {
         let poly = Polynomial::rnd(s, threshold);
 
         let shares = poly.shares(parties);
-        let S_shares = shares.0.iter().map(|s| s * &G).collect::<Vec<_>>();
-
-        let r_s = Polynomial::interpolate(&shares.0[0..2*threshold + 1]);
+        let S_shares = &shares * &G;
+        
+        let r_s = shares.recover();
         assert!(s == r_s);
 
-        let r_S = RistrettoPolynomial::interpolate(&S_shares[0..2*threshold + 1]);
+        let r_S = S_shares.recover();
         assert!(S == r_S);
     }
 }
