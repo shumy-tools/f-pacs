@@ -7,6 +7,7 @@ use serde::{Serialize, Deserialize};
 use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
 
 use std::io::{Read, Write, Cursor};
+
 use crypto::aessafe::{AesSafe128Encryptor, AesSafe128Decryptor};
 use aesstream::{AesWriter, AesReader};
 
@@ -19,13 +20,36 @@ pub type Result<T> = std::result::Result<T, BoxError>;
 #[inline]
 pub fn error(msg: &str) -> BoxError { From::from(msg) }
 
+//-----------------------------------------------------------------------------------------------------------
+// LambdaKey
+//-----------------------------------------------------------------------------------------------------------
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
+pub struct LambdaKey {
+    key: Vec<u8>
+}
 
-pub fn lambda(alpha: &CompressedRistretto, id: &str, set: &str) -> Vec<u8> {
-    Sha512::new()
-        .chain(alpha.as_bytes())
-        .chain(id)
-        .chain(set)
-        .result().to_vec()
+impl LambdaKey {
+    pub fn new(alpha: &CompressedRistretto, id: &str, set: &str) -> Self {
+        let key = Sha512::new()
+            .chain(alpha.as_bytes())
+            .chain(id)
+            .chain(set)
+            .result().to_vec();
+        
+        Self { key }
+    }
+
+    pub fn k128(&self) -> &[u8; 16] {
+        arrayref::array_ref!(self.key, 0, 16)
+    }
+
+    pub fn k192(&self) -> &[u8; 24] {
+        arrayref::array_ref!(self.key, 0, 24)
+    }
+
+    pub fn k256(&self) -> &[u8; 32] {
+        arrayref::array_ref!(self.key, 0, 32)
+    }
 }
 
 //-----------------------------------------------------------------------------------------------------------
@@ -83,7 +107,7 @@ impl RnChain {
         let id = self.id();
         let set = self.set();
 
-        let mut lambda = Some(lambda(alpha, id, set));
+        let mut lambda = Some(LambdaKey::new(alpha, id, set));
         let mut chain = Vec::<RnFileRef>::new();
         for rn in self.chain.iter().rev() {
             let data = rn.data.data(&lambda.as_ref().unwrap())?;
@@ -101,7 +125,7 @@ impl RnChain {
 //-----------------------------------------------------------------------------------------------------------
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct RnData {
-    pub lambda_prev: Option<Vec<u8>>,
+    pub lambda_prev: Option<LambdaKey>,
     pub file: RnFileRef
 }
 
@@ -112,15 +136,15 @@ pub struct RnEncData {
 }
 
 impl RnEncData {
-    fn new(ekey: &RistrettoPoint, id: &str, set: &str, cd: &RnData) -> (Vec<u8>, Self) {
+    fn new(ekey: &RistrettoPoint, id: &str, set: &str, cd: &RnData) -> (LambdaKey, Self) {
         let k = rnd_scalar();
         let alpha = (k * ekey).compress();
-        let lambda = lambda(&alpha, id, set);
+        let lambda = LambdaKey::new(&alpha, id, set);
 
         // E_{lambda} [kn_prev, dn, hfile]
         let mut data = Vec::new();
         {
-            let encryptor = AesSafe128Encryptor::new(&lambda[..16]);
+            let encryptor = AesSafe128Encryptor::new(lambda.k128());
             let mut writer = AesWriter::new(&mut data, encryptor).unwrap();
             let b_cd = bincode::serialize(cd).unwrap();
             writer.write_all(&b_cd).unwrap();
@@ -129,11 +153,11 @@ impl RnEncData {
         (lambda, Self { kn: (k * &G), data })
     }
 
-    fn data(&self, lambda: &[u8]) -> Result<RnData> {
+    fn data(&self, lambda: &LambdaKey) -> Result<RnData> {
         // D_{lambda} [kn_prev, dn, hfile]
         let mut data = Vec::new();
         {
-            let decryptor = AesSafe128Decryptor::new(&lambda[..16]);
+            let decryptor = AesSafe128Decryptor::new(lambda.k128());
             let mut reader = AesReader::new(Cursor::new(&self.data), decryptor)?;
             reader.read_to_end(&mut data)?;
         }
@@ -166,7 +190,7 @@ impl Rn {
         &self.sig.key
     }
 
-    pub fn head(keyp: &KeyPair, ekey: &RistrettoPoint, id: &str, set: &str, rd: RnData) -> (Vec<u8>, Self) {
+    pub fn head(keyp: &KeyPair, ekey: &RistrettoPoint, id: &str, set: &str, rd: RnData) -> (LambdaKey, Self) {
         let (lambda, data) = RnEncData::new(ekey, id, set, &rd);
         let dhash = Sha512::new()
             .chain(id)
@@ -178,7 +202,7 @@ impl Rn {
         (lambda, Self { id: Some(id.into()), set: Some(set.into()), hprev: None, data, sig })
     }
 
-    pub fn tail(keyp: &KeyPair, ekey: &RistrettoPoint, hprev: &[u8], id: &str, set: &str, rd: RnData) -> (Vec<u8>, Self) {
+    pub fn tail(keyp: &KeyPair, ekey: &RistrettoPoint, hprev: &[u8], id: &str, set: &str, rd: RnData) -> (LambdaKey, Self) {
         let (lambda, data) = RnEncData::new(ekey, id, set, &rd);
         let dhash = Sha512::new()
             .chain(hprev)
@@ -198,7 +222,7 @@ impl Rn {
         Ok(dhash)
     }
 
-    fn hash(&self) -> Vec<u8> {
+    pub fn hash(&self) -> Vec<u8> {
         let dhash = match self.id {
             Some(_) => Sha512::new()
                 .chain(self.id.as_ref().unwrap())
@@ -296,7 +320,7 @@ mod tests {
         assert!(r1.check().is_ok());
 
         let alpha = (ekp.s * &r1.data.kn).compress();
-        let lambda = lambda(&alpha, id, set);
+        let lambda = LambdaKey::new(&alpha, id, set);
         let cd2 = r1.data.data(&lambda).unwrap();
         assert!(cd1 == cd2);
     }
