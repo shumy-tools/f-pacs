@@ -172,11 +172,6 @@ pub trait Interpolate<S> {
     fn interpolate(shares: &[S]) -> Self::Output;
 }
 
-pub trait Reconstruct<S> {
-    type Output;
-    fn reconstruct(shares: &[S]) -> Self::Output;
-}
-
 pub trait Evaluate {
     type Output;
     fn evaluate(&self, x: &Scalar) -> Self::Output;
@@ -286,25 +281,6 @@ impl Interpolate<Share> for Polynomial {
     }
 }
 
-impl Reconstruct<Share> for Polynomial {
-    type Output = Polynomial;
-
-    fn reconstruct(shares: &[Share]) -> Polynomial {
-        let range = shares.iter().map(|s| Scalar::from(s.i)).collect::<Vec<_>>();
-
-        let mut acc = vec![Scalar::zero(); range.len()];
-        for (i, item) in shares.iter().enumerate() {
-            let (num, barycentric) = lx_num_bar(&range, i);
-            for j in 0..num.len() {
-                acc[j] += num[j] * barycentric * item.yi;
-            }
-        }
-        
-        cut_tail(&mut acc, Scalar::zero());
-        Polynomial { a: acc }
-    }
-}
-
 impl Degree for Polynomial {
     fn degree(&self) -> usize {
         self.a.len() - 1
@@ -375,26 +351,6 @@ impl Interpolate<RistrettoShare> for RistrettoPolynomial {
     }
 }
 
-impl Reconstruct<RistrettoShare> for RistrettoPolynomial {
-    type Output = RistrettoPolynomial;
-
-    #[allow(non_snake_case)]
-    fn reconstruct(shares: &[RistrettoShare]) -> RistrettoPolynomial {
-        let range = shares.iter().map(|s| Scalar::from(s.i)).collect::<Vec<_>>();
-
-        let mut acc = vec![RistrettoPoint::default(); range.len()];
-        for (i, item) in shares.iter().enumerate() {
-            let (num, barycentric) = lx_num_bar(&range, i);
-            for j in 0..num.len() {
-                acc[j] += num[j] * barycentric * item.Yi;
-            }
-        }
-
-        cut_tail(&mut acc, RistrettoPoint::default());
-        RistrettoPolynomial { A: acc }
-    }
-}
-
 impl Degree for RistrettoPolynomial {
     fn degree(&self) -> usize {
         self.A.len() - 1
@@ -414,17 +370,17 @@ mod tests {
         let parties = 3*threshold + 1;
 
         let s = rnd_scalar();
+        let S = s * &G;
 
         let poly = Polynomial::rnd(s, threshold);
-        let S_poly = &poly * &G;
 
         let shares = poly.shares(parties);
         let S_shares = shares.0.iter().map(|s| s * &G).collect::<Vec<_>>();
 
-        let r_poly = Polynomial::reconstruct(&shares.0[0..2*threshold + 1]);
-        assert!(poly == r_poly);
+        let r_s = Polynomial::interpolate(&shares.0[0..2*threshold + 1]);
+        assert!(s == r_s);
 
-        let S_r_poly = RistrettoPolynomial::reconstruct(&S_shares[0..2*threshold + 1]);
-        assert!(S_poly == S_r_poly);
+        let r_S = RistrettoPolynomial::interpolate(&S_shares[0..2*threshold + 1]);
+        assert!(S == r_S);
     }
 }

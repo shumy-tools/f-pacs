@@ -18,19 +18,19 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 // Chain structure
 //-----------------------------------------------------------------------------------------------------------
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
-pub struct ChainData {
+pub struct RnData {
     pub lambda_prev: Option<Vec<u8>>,
     pub dn: Vec<u8>,
     pub hfile: Vec<u8>
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Chain {
+pub struct RnEncData {
     pub kn: RistrettoPoint,
     data: Vec<u8>
 }
 
-impl Chain {
+impl RnEncData {
     pub fn lambda(alpha: &CompressedRistretto, id: &str, set: &str) -> Vec<u8> {
         Sha512::new()
             .chain(alpha.as_bytes())
@@ -39,10 +39,10 @@ impl Chain {
             .result().to_vec()
     }
 
-    pub fn new(ekey: &RistrettoPoint, id: &str, set: &str, cd: &ChainData) -> Result<Self> {
+    pub fn new(ekey: &RistrettoPoint, id: &str, set: &str, cd: &RnData) -> Result<Self> {
         let k = rnd_scalar();
         let alpha = (k * ekey).compress();
-        let lambda = Chain::lambda(&alpha, id, set);
+        let lambda = RnEncData::lambda(&alpha, id, set);
 
         // E_{lambda} [kn_prev, dn, hfile]
         let mut data = Vec::new();
@@ -56,8 +56,8 @@ impl Chain {
         Ok(Self { kn: (k * &G), data })
     }
 
-    pub fn data(&self, alpha: &CompressedRistretto, id: &str, set: &str) -> Result<ChainData> {
-        let lambda = Chain::lambda(alpha, id, set);
+    pub fn data(&self, alpha: &CompressedRistretto, id: &str, set: &str) -> Result<RnData> {
+        let lambda = RnEncData::lambda(alpha, id, set);
 
         // D_{lambda} [kn_prev, dn, hfile]
         let mut data = Vec::new();
@@ -67,7 +67,7 @@ impl Chain {
             reader.read_to_end(&mut data)?;
         }
 
-        let cd: ChainData = bincode::deserialize(&data)?;
+        let cd: RnData = bincode::deserialize(&data)?;
         Ok(cd)
     }
 
@@ -86,7 +86,7 @@ pub struct Rn {
     pub id: Option<String>,
     pub set: Option<String>,
     pub hprev: Option<Vec<u8>>,
-    pub chain: Chain,
+    pub data: RnEncData,
     sig: ExtSignature
 }
 
@@ -95,27 +95,27 @@ impl Rn {
         &self.sig.key
     }
 
-    pub fn head(keyp: &KeyPair, id: &str, set: &str, chain: Chain) -> Self {
+    pub fn head(keyp: &KeyPair, id: &str, set: &str, data: RnEncData) -> Self {
         let dhash = Sha512::new()
             .chain(id)
             .chain(set)
-            .chain(chain.to_vec())
+            .chain(data.to_vec())
             .result();
 
         let sig = ExtSignature::sign(&keyp.s, keyp.key.clone(), dhash.as_slice());
 
-        Self { id: Some(id.into()), set: Some(set.into()), hprev: None, chain, sig }
+        Self { id: Some(id.into()), set: Some(set.into()), hprev: None, data, sig }
     }
 
-    pub fn tail(keyp: &KeyPair, hprev: &[u8], chain: Chain) -> Self {
+    pub fn tail(keyp: &KeyPair, hprev: &[u8], data: RnEncData) -> Self {
         let dhash = Sha512::new()
             .chain(hprev)
-            .chain(chain.to_vec())
+            .chain(data.to_vec())
             .result();
 
         let sig = ExtSignature::sign(&keyp.s, keyp.key.clone(), dhash.as_slice());
 
-        Self { id: None, set: None, hprev: Some(hprev.into()), chain, sig }
+        Self { id: None, set: None, hprev: Some(hprev.into()), data, sig }
     }
 
     pub fn hash(&self) -> Vec<u8> {
@@ -123,11 +123,11 @@ impl Rn {
             Some(_) => Sha512::new()
                 .chain(self.id.as_ref().unwrap())
                 .chain(self.set.as_ref().unwrap())
-                .chain(self.chain.to_vec())
+                .chain(self.data.to_vec())
                 .result(),
             None => Sha512::new()
                 .chain(self.hprev.as_ref().unwrap())
-                .chain(self.chain.to_vec())
+                .chain(self.data.to_vec())
                 .result()
         };
 
@@ -143,26 +143,39 @@ impl Rn {
 //-----------------------------------------------------------------------------------------------------------
 // FnAdaptor (read/write)
 //-----------------------------------------------------------------------------------------------------------
-pub struct FnAdaptor;
+pub struct WriteInterceptor<W: Write, F: FnMut(&[u8]) -> ()>(pub W, pub F);
+impl<W: Write, F: FnMut(&[u8]) -> ()> Write for WriteInterceptor<W, F> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (self.1)(buf);
+        self.0.write(buf)
+    }
 
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+pub struct ReadInterceptor<R: Read, F: FnMut(&[u8]) -> ()>(pub R, pub F);
+impl<R: Read, F: FnMut(&[u8]) -> ()> Read for ReadInterceptor<R, F> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let size = self.0.read(buf)?;
+        (self.1)(&buf[..size]);
+        Ok(size)
+    }
+}
+
+pub struct FnAdaptor;
 impl FnAdaptor {
     pub fn save<R: Read, W: Write>(keyp: &KeyPair, dn: &[u8; 16], mut from: R, mut to: W) -> Result<ExtSignature> {
-        let encryptor = AesSafe128Encryptor::new(dn);
-        let mut writer = AesWriter::new(&mut to, encryptor)?;
-
         let mut hasher = Sha512::new();
-        let mut buf = [0u8; 1024*1024];
-        loop {
-            let size = from.read(&mut buf)?;
-            if size == 0 {
-                break;
-            }
+        {
+            let encryptor = AesSafe128Encryptor::new(dn);
 
-            // FIX: hash of the plaintext! Not the best security.
-            hasher.input(&buf[..size]);
-            writer.write(&buf[..size])?;
+            // from(plaintext) -> writer -> interceptor -> to(ciphertext)
+            let mut interceptor = WriteInterceptor(&mut to, |buf| hasher.input(buf));
+            let mut writer = AesWriter::new(&mut interceptor, encryptor)?;
+            std::io::copy(&mut from, &mut writer)?;
         }
-        writer.flush()?;
 
         let dhash = hasher.result();
         let sig = ExtSignature::sign(&keyp.s, keyp.key.clone(), dhash.as_slice());
@@ -171,22 +184,15 @@ impl FnAdaptor {
     }
 
     pub fn load<R: Read, W: Write>(sig: &ExtSignature, dn: &[u8; 16], mut from: R, mut to: W) -> Result<()> {
-        let decryptor = AesSafe128Decryptor::new(dn);
-        let mut reader = AesReader::new(&mut from, decryptor)?;
-
         let mut hasher = Sha512::new();
-        let mut buf = [0u8; 1024*1024];
-        loop {
-            let size = reader.read(&mut buf)?;
-            if size == 0 {
-                break;
-            }
-
-            // FIX: hash of the plaintext! Not the best security.
-            hasher.input(&buf[..size]);
-            to.write(&buf[..size])?;
+        {
+            let decryptor = AesSafe128Decryptor::new(dn);
+            
+            // from(ciphertext) -> interceptor -> reader -> to(plaintext)
+            let mut interceptor = ReadInterceptor(&mut from, |buf| hasher.input(buf));
+            let mut reader = AesReader::new(&mut interceptor, decryptor)?;
+            std::io::copy(&mut reader, &mut to)?;
         }
-        to.flush()?;
 
         let dhash = hasher.result();
         if !sig.verify(&dhash) {
@@ -213,13 +219,13 @@ mod tests {
         let dn = b"encryption123456".to_vec();
         let hfile = b"file-url".to_vec();
 
-        let cd1 = ChainData { lambda_prev: None, dn, hfile };
-        let c1 = Chain::new(&ekp.key, id, set, &cd1).unwrap();
+        let cd1 = RnData { lambda_prev: None, dn, hfile };
+        let c1 = RnEncData::new(&ekp.key, id, set, &cd1).unwrap();
         let r1 = Rn::head(&skp, id, set, c1);
         assert!(r1.check());
 
-        let alpha = (ekp.s * &r1.chain.kn).compress();
-        let cd2 = r1.chain.data(&alpha, id, set).unwrap();
+        let alpha = (ekp.s * &r1.data.kn).compress();
+        let cd2 = r1.data.data(&alpha, id, set).unwrap();
         assert!(cd1 == cd2);
     }
 
@@ -227,14 +233,14 @@ mod tests {
     fn file_write_load() {
         let dn = b"encryption123456";
         let data = b"sjdhflasdvbasliyfbrlaiybasrivbaskdvjb4o837t239846g5uybgsidufbyv586fge58b6ves58";
-        let kp = KeyPair::new();
+        let skp = KeyPair::new(); // source key-pair
         
         let mut plaintext1 = Vec::new();
         plaintext1.extend(data.to_vec());
         let mut ciphertext = Vec::new();
 
         // write data
-        let sig = FnAdaptor::save(&kp, dn, Cursor::new(&plaintext1), &mut ciphertext).unwrap();
+        let sig = FnAdaptor::save(&skp, dn, Cursor::new(&plaintext1), &mut ciphertext).unwrap();
 
         // read data
         let mut plaintext2 = Vec::new();
