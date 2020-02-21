@@ -12,16 +12,92 @@ use aesstream::{AesWriter, AesReader};
 use crate::crypto::*;
 use crate::crypto::signatures::*;
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type BoxError = Box<dyn std::error::Error>;
+pub type Result<T> = std::result::Result<T, BoxError>;
+
+#[inline]
+pub fn error(msg: &str) -> BoxError { From::from(msg) }
+
+
+pub fn lambda(alpha: &CompressedRistretto, id: &str, set: &str) -> Vec<u8> {
+    Sha512::new()
+        .chain(alpha.as_bytes())
+        .chain(id)
+        .chain(set)
+        .result().to_vec()
+}
 
 //-----------------------------------------------------------------------------------------------------------
-// Chain structure
+// RnChain
+//-----------------------------------------------------------------------------------------------------------
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
+pub struct RnFileRef {
+    pub dn: [u8; 16],
+    pub hfile: Vec<u8>
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct RnChain {
+    pub lhash: Vec<u8>, // last Rn hash
+    pub chain: Vec<Rn>
+}
+
+impl RnChain {
+    pub fn id(&self) -> &str {
+        self.chain.first().unwrap().id.as_ref().unwrap()
+    }
+
+    pub fn set(&self) -> &str {
+        self.chain.first().unwrap().set.as_ref().unwrap()
+    }
+
+    pub fn new(head: Rn) -> Result<Self> {
+        let lhash = head.check()?;
+        if head.id.is_none() {
+            Err("Record is not a head type!")?
+        }
+        
+        Ok(Self { lhash, chain: vec![head] })
+    }
+
+    pub fn push(&mut self, tail: Rn) -> Result<()> {
+        let dhash = tail.check()?;
+
+        let hprev = tail.hprev.as_ref().ok_or_else(|| error("Record is not a tail type!"))?;
+        if &self.lhash != hprev {
+            Err("Incorrect hash chain!")?
+        }
+
+        self.lhash = dhash;
+        self.chain.push(tail);
+
+        Ok(())
+    }
+
+    pub fn recover(&self, alpha: &CompressedRistretto) -> Result<Vec<RnFileRef>> {
+        let id = self.id();
+        let set = self.set();
+
+        let mut lambda = Some(lambda(alpha, id, set));
+        let mut chain = Vec::<RnFileRef>::new();
+        for rn in self.chain.iter().rev() {
+            let data = rn.data.data(&lambda.as_ref().unwrap())?;
+            lambda = data.lambda_prev;
+            chain.push(data.file);
+        }
+
+        chain.reverse();
+        Ok(chain)
+    }
+}
+
+//-----------------------------------------------------------------------------------------------------------
+// Rn data structure
 //-----------------------------------------------------------------------------------------------------------
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct RnData {
     pub lambda_prev: Option<Vec<u8>>,
-    pub dn: Vec<u8>,
-    pub hfile: Vec<u8>
+    pub file: RnFileRef
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -31,18 +107,10 @@ pub struct RnEncData {
 }
 
 impl RnEncData {
-    pub fn lambda(alpha: &CompressedRistretto, id: &str, set: &str) -> Vec<u8> {
-        Sha512::new()
-            .chain(alpha.as_bytes())
-            .chain(id)
-            .chain(set)
-            .result().to_vec()
-    }
-
-    pub fn new(ekey: &RistrettoPoint, id: &str, set: &str, cd: &RnData) -> Result<Self> {
+    fn new(ekey: &RistrettoPoint, id: &str, set: &str, cd: &RnData) -> Result<Self> {
         let k = rnd_scalar();
         let alpha = (k * ekey).compress();
-        let lambda = RnEncData::lambda(&alpha, id, set);
+        let lambda = lambda(&alpha, id, set);
 
         // E_{lambda} [kn_prev, dn, hfile]
         let mut data = Vec::new();
@@ -56,9 +124,7 @@ impl RnEncData {
         Ok(Self { kn: (k * &G), data })
     }
 
-    pub fn data(&self, alpha: &CompressedRistretto, id: &str, set: &str) -> Result<RnData> {
-        let lambda = RnEncData::lambda(alpha, id, set);
-
+    fn data(&self, lambda: &[u8]) -> Result<RnData> {
         // D_{lambda} [kn_prev, dn, hfile]
         let mut data = Vec::new();
         {
@@ -71,7 +137,7 @@ impl RnEncData {
         Ok(cd)
     }
 
-    pub fn to_vec(&self) -> Vec<u8> {
+    fn to_vec(&self) -> Vec<u8> {
         let kn_comp = self.kn.compress();
         let data: &[&[u8]] = &[kn_comp.as_bytes(), &self.data];
         data.concat()
@@ -95,7 +161,8 @@ impl Rn {
         &self.sig.key
     }
 
-    pub fn head(keyp: &KeyPair, id: &str, set: &str, data: RnEncData) -> Self {
+    pub fn head(keyp: &KeyPair, ekey: &RistrettoPoint, id: &str, set: &str, rd: RnData) -> Self {
+        let data = RnEncData::new(ekey, id, set, &rd).unwrap();
         let dhash = Sha512::new()
             .chain(id)
             .chain(set)
@@ -107,7 +174,8 @@ impl Rn {
         Self { id: Some(id.into()), set: Some(set.into()), hprev: None, data, sig }
     }
 
-    pub fn tail(keyp: &KeyPair, hprev: &[u8], data: RnEncData) -> Self {
+    pub fn tail(keyp: &KeyPair, ekey: &RistrettoPoint, hprev: &[u8], id: &str, set: &str, rd: RnData) -> Self {
+        let data = RnEncData::new(ekey, id, set, &rd).unwrap();
         let dhash = Sha512::new()
             .chain(hprev)
             .chain(data.to_vec())
@@ -118,7 +186,16 @@ impl Rn {
         Self { id: None, set: None, hprev: Some(hprev.into()), data, sig }
     }
 
-    pub fn hash(&self) -> Vec<u8> {
+    pub fn check(&self) -> Result<Vec<u8>> {
+        let dhash = self.hash();
+        if !self.sig.verify(&dhash) {
+            Err("Invalid record signature!")?
+        }
+
+        Ok(dhash)
+    }
+
+    fn hash(&self) -> Vec<u8> {
         let dhash = match self.id {
             Some(_) => Sha512::new()
                 .chain(self.id.as_ref().unwrap())
@@ -132,11 +209,6 @@ impl Rn {
         };
 
         dhash.to_vec()
-    }
-
-    pub fn check(&self) -> bool {
-        let dhash = self.hash();
-        self.sig.verify(&dhash)
     }
 }
 
@@ -196,7 +268,7 @@ impl FnAdaptor {
 
         let dhash = hasher.result();
         if !sig.verify(&dhash) {
-            return Err("Signature verification failed!".into());
+            Err("Signature verification failed!")?
         }
 
         Ok(())
@@ -216,17 +288,52 @@ mod tests {
         let id = "subject-id";
         let set = "dataset-id";
 
-        let dn = b"encryption123456".to_vec();
-        let hfile = b"file-url".to_vec();
-
-        let cd1 = RnData { lambda_prev: None, dn, hfile };
-        let c1 = RnEncData::new(&ekp.key, id, set, &cd1).unwrap();
-        let r1 = Rn::head(&skp, id, set, c1);
-        assert!(r1.check());
+        let cd1 = RnData { lambda_prev: None, file: RnFileRef { dn: *b"encryption123456", hfile: b"file-url".to_vec() } };
+        let r1 = Rn::head(&skp, &ekp.key, id, set, cd1.clone());
+        assert!(r1.check().is_ok());
 
         let alpha = (ekp.s * &r1.data.kn).compress();
-        let cd2 = r1.data.data(&alpha, id, set).unwrap();
+        let lambda = lambda(&alpha, id, set);
+        let cd2 = r1.data.data(&lambda).unwrap();
         assert!(cd1 == cd2);
+    }
+
+    #[test]
+    fn chain_write_load() {
+        let ekp = KeyPair::new(); // master key-pair
+        let skp = KeyPair::new(); // source key-pair
+
+        let id = "subject-id";
+        let set = "dataset-id";
+
+            let rd = RnData { lambda_prev: None, file: RnFileRef { dn: *b"encryption123456", hfile: b"file-1-url".to_vec() } };
+            let r = Rn::head(&skp, &ekp.key, id, set, rd);
+            let alpha = (ekp.s * &r.data.kn).compress();
+        
+        let mut chain = RnChain::new(r).unwrap();
+        
+            let lamb = lambda(&alpha, id, set);
+            let rd = RnData { lambda_prev: Some(lamb), file: RnFileRef { dn: *b"encryption654321", hfile: b"file-2-url".to_vec() } };
+            let r = Rn::tail(&skp, &ekp.key, &chain.lhash, id, set, rd);
+            let alpha = (ekp.s * &r.data.kn).compress();
+
+        chain.push(r).unwrap();
+
+            let lamb = lambda(&alpha, id, set);
+            let rd = RnData { lambda_prev: Some(lamb), file: RnFileRef { dn: *b"encryption564321", hfile: b"file-3-url".to_vec() } };
+            let r = Rn::tail(&skp, &ekp.key, &chain.lhash, id, set, rd);
+            let alpha = (ekp.s * &r.data.kn).compress();
+
+        chain.push(r).unwrap();
+
+        let refs = chain.recover(&alpha).unwrap();
+
+        let mut res: String = "".into();
+        for r in refs.iter() {
+          res += &format!("(dn={}, hfile={})", std::str::from_utf8(&r.dn).unwrap(), std::str::from_utf8(&r.hfile).unwrap());
+        }
+
+        assert!(res == "(dn=encryption123456, hfile=file-1-url)(dn=encryption654321, hfile=file-2-url)(dn=encryption564321, hfile=file-3-url)");
     }
 
     #[test]
