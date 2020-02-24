@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
-use sha2::{Sha512, Digest};
+use sha2::{Sha256, Digest};
 use serde::{Serialize, Deserialize};
 
 use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
 
-use std::io::{Read, Write, Cursor};
+use std::io::{Read, Write};
 
 use crypto::aessafe::{AesSafe128Encryptor, AesSafe128Decryptor};
 use aesstream::{AesWriter, AesReader};
@@ -30,7 +30,7 @@ pub struct LambdaKey {
 
 impl LambdaKey {
     pub fn new(alpha: &CompressedRistretto, id: &str, set: &str) -> Self {
-        let key = Sha512::new()
+        let key = Sha256::new()
             .chain(alpha.as_bytes())
             .chain(id)
             .chain(set)
@@ -158,7 +158,7 @@ impl RnEncData {
         let mut data = Vec::new();
         {
             let decryptor = AesSafe128Decryptor::new(lambda.k128());
-            let mut reader = AesReader::new(Cursor::new(&self.data), decryptor)?;
+            let mut reader = AesReader::new(self.data.as_slice(), decryptor)?;
             reader.read_to_end(&mut data)?;
         }
 
@@ -192,7 +192,7 @@ impl Rn {
 
     pub fn head(keyp: &KeyPair, ekey: &RistrettoPoint, id: &str, set: &str, rd: RnData) -> (LambdaKey, Self) {
         let (lambda, data) = RnEncData::new(ekey, id, set, &rd);
-        let dhash = Sha512::new()
+        let dhash = Sha256::new()
             .chain(id)
             .chain(set)
             .chain(data.to_vec())
@@ -204,7 +204,7 @@ impl Rn {
 
     pub fn tail(keyp: &KeyPair, ekey: &RistrettoPoint, hprev: &[u8], id: &str, set: &str, rd: RnData) -> (LambdaKey, Self) {
         let (lambda, data) = RnEncData::new(ekey, id, set, &rd);
-        let dhash = Sha512::new()
+        let dhash = Sha256::new()
             .chain(hprev)
             .chain(data.to_vec())
             .result();
@@ -224,12 +224,12 @@ impl Rn {
 
     pub fn hash(&self) -> Vec<u8> {
         let dhash = match self.id {
-            Some(_) => Sha512::new()
+            Some(_) => Sha256::new()
                 .chain(self.id.as_ref().unwrap())
                 .chain(self.set.as_ref().unwrap())
                 .chain(self.data.to_vec())
                 .result(),
-            None => Sha512::new()
+            None => Sha256::new()
                 .chain(self.hprev.as_ref().unwrap())
                 .chain(self.data.to_vec())
                 .result()
@@ -242,7 +242,40 @@ impl Rn {
 //-----------------------------------------------------------------------------------------------------------
 // FnAdaptor (read/write)
 //-----------------------------------------------------------------------------------------------------------
-pub struct WriteInterceptor<W: Write, F: FnMut(&[u8]) -> ()>(pub W, pub F);
+/*fn copy_until<R: Read, W: Write>(mut from: R, mut to: W, reminder: &mut [u8]) -> std::io::Result<u64> {
+    const BUF_SIZE: usize = 1024*1024;
+    let size = reminder.len();
+
+    // double buffer reader
+    let mut total = 064;
+    let mut back_as_data = true;
+    let mut buf1 = [0u8; BUF_SIZE];
+    let mut buf2 = [0u8; BUF_SIZE];
+    let mut front = buf1.as_ref();
+    let mut back = buf2.as_ref();
+    loop {
+        if back_as_data {
+            total += 
+            to.write(back)?;
+        }
+
+        let size = from.read(&mut front)?;
+        if size == 1024*1024 { // continue
+            std::mem::swap(&mut front, &mut back);
+            back_as_data = true;
+        } else { // last data block
+            to.write_all(&front[..size]);
+            break;
+        }
+    }
+
+    // grab signature data!
+    let b_sig = [0u8; SIG_SIZE];
+    back.chain(front).iter().rev().take(SIG_SIZE);
+    Ok(total)
+}*/
+
+pub struct WriteInterceptor<W: Write, F: FnMut(&[u8]) -> ()>(W, F);
 impl<W: Write, F: FnMut(&[u8]) -> ()> Write for WriteInterceptor<W, F> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         (self.1)(buf);
@@ -254,7 +287,7 @@ impl<W: Write, F: FnMut(&[u8]) -> ()> Write for WriteInterceptor<W, F> {
     }
 }
 
-pub struct ReadInterceptor<R: Read, F: FnMut(&[u8]) -> ()>(pub R, pub F);
+pub struct ReadInterceptor<R: Read, F: FnMut(&[u8]) -> ()>(R, F);
 impl<R: Read, F: FnMut(&[u8]) -> ()> Read for ReadInterceptor<R, F> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let size = self.0.read(buf)?;
@@ -263,36 +296,106 @@ impl<R: Read, F: FnMut(&[u8]) -> ()> Read for ReadInterceptor<R, F> {
     }
 }
 
+pub struct ReadUntil<R: Read>{
+    from: R,
+    buffer: Vec<u8>,
+    remainder: usize,
+    end: usize
+}
+
+impl<R: Read> Read for ReadUntil<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut total = 0usize;
+        while total != buf.len() {
+            let mut slice = &mut self.buffer[self.end..];
+            self.end += self.from.read(&mut slice)?;
+            if self.end < self.remainder {
+                use std::io::{Error, ErrorKind};
+                return Err(Error::new(ErrorKind::InvalidInput, format!("Expected input size of at least {}", self.remainder)));
+            }
+
+            let top = self.end - self.remainder;
+            if top == 0 {
+                break;
+            }
+            
+            let left = buf.len() - total;
+            let moved = if top <= left {
+                let slice = &mut buf[total..(total + top)];
+                slice.copy_from_slice(&self.buffer[..top]);
+                top
+            } else {
+                let slice = &mut buf[total..];
+                slice.copy_from_slice(&self.buffer[..left]);
+                left
+            };
+
+            // FIX: rotate_left is not efficient - should only copy [0..moved]
+            self.buffer.rotate_left(moved);
+            /*{
+                let (left, right) = self.buffer.split_at_mut(moved);
+                left.copy_from_slice(&right[..top]);
+            }*/
+            
+            self.end -= moved;
+            total += moved;
+        }
+        
+        Ok(total)
+    }
+}
+
+impl<R: Read> ReadUntil<R> {
+    pub fn new(from: R, remainder: usize) -> Self {
+        Self { from, buffer: vec![0u8; 1024 + remainder], remainder, end: 0 }
+    }
+
+    pub fn remainder(&self) -> &[u8] {
+        &self.buffer[(self.end - self.remainder)..self.end]
+    }
+}
+
 pub struct FnAdaptor;
 impl FnAdaptor {
-    pub fn save<R: Read, W: Write>(keyp: &KeyPair, dn: &[u8; 16], mut from: R, mut to: W) -> Result<ExtSignature> {
-        let mut hasher = Sha512::new();
-        {
-            let encryptor = AesSafe128Encryptor::new(dn);
+    pub fn save<R: Read, W: Write>(keyp: &KeyPair, dn: &[u8; 16], mut from: R, mut to: W) -> Result<()> {
+        let mut hasher = Sha256::new();
+        let encryptor = AesSafe128Encryptor::new(dn);
 
-            // from(plaintext) -> writer -> interceptor -> to(ciphertext)
+        // write and hash ciphertext
+        {// from(plaintext) -> writer -> interceptor -> to(ciphertext)
             let mut interceptor = WriteInterceptor(&mut to, |buf| hasher.input(buf));
             let mut writer = AesWriter::new(&mut interceptor, encryptor)?;
             std::io::copy(&mut from, &mut writer)?;
-        }
+        };
 
+        // construct signature
         let dhash = hasher.result();
         let sig = ExtSignature::sign(&keyp.s, keyp.key.clone(), dhash.as_slice());
+        
+        // write signature
+        let b_sig = bincode::serialize(&sig)?;
+        to.write_all(&b_sig)?;
 
-        Ok(sig)
+        Ok(())
     }
 
-    pub fn load<R: Read, W: Write>(sig: &ExtSignature, dn: &[u8; 16], mut from: R, mut to: W) -> Result<()> {
-        let mut hasher = Sha512::new();
-        {
-            let decryptor = AesSafe128Decryptor::new(dn);
-            
-            // from(ciphertext) -> interceptor -> reader -> to(plaintext)
-            let mut interceptor = ReadInterceptor(&mut from, |buf| hasher.input(buf));
+    pub fn load<R: Read, W: Write>(dn: &[u8; 16], mut from: R, mut to: W) -> Result<()> {
+        let mut hasher = Sha256::new();
+        let decryptor = AesSafe128Decryptor::new(dn);
+        let mut encrypted = ReadUntil::new(&mut from, 136); // NOTE: bincode::serialize(&sig) results in 136 bytes!
+
+        // read and hash ciphertext
+        {// from(ciphertext) -> interceptor -> reader -> to(plaintext)
+            let mut interceptor = ReadInterceptor(&mut encrypted, |buf| hasher.input(buf));
             let mut reader = AesReader::new(&mut interceptor, decryptor)?;
             std::io::copy(&mut reader, &mut to)?;
-        }
+        };
 
+        // read signature
+        let b_sig = encrypted.remainder();
+        let sig: ExtSignature = bincode::deserialize(b_sig)?;
+
+        // verify signature
         let dhash = hasher.result();
         if !sig.verify(&dhash) {
             Err("Signature verification failed!")?
@@ -363,7 +466,7 @@ mod tests {
     #[test]
     fn file_write_load() {
         let dn = b"encryption123456";
-        let data = b"sjdhflasdvbasliyfbrlaiybasrivbaskdvjb4o837t239846g5uybgsidufbyv586fge58b6ves58";
+        let data = b"sjdhflasdvbasliyfbrlaiybasrivbaskdvjb4o837t239846g5uybgsidufbyv586fge58b6ves58dsfgsdfgsdfg";
         let skp = KeyPair::new(); // source key-pair
         
         let mut plaintext1 = Vec::new();
@@ -371,11 +474,11 @@ mod tests {
         let mut ciphertext = Vec::new();
 
         // write data
-        let sig = FnAdaptor::save(&skp, dn, Cursor::new(&plaintext1), &mut ciphertext).unwrap();
+        FnAdaptor::save(&skp, dn, plaintext1.as_slice(), &mut ciphertext).unwrap();
 
         // read data
         let mut plaintext2 = Vec::new();
-        FnAdaptor::load(&sig, dn, Cursor::new(&ciphertext), &mut plaintext2).unwrap();
+        FnAdaptor::load(dn, ciphertext.as_slice(), &mut plaintext2).unwrap();
 
         assert!(plaintext1 == plaintext2);
     }
