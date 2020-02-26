@@ -1,6 +1,8 @@
 mod crypto;
 mod structs;
 
+use std::time::{Instant, Duration};
+
 use crate::crypto::*;
 use crate::crypto::shares::*;
 use crate::structs::*;
@@ -42,4 +44,37 @@ fn main() {
   for r in refs.iter() {
     println!("({}, {})", std::str::from_utf8(&r.dn).unwrap(), std::str::from_utf8(&r.hfile).unwrap());
   }
+
+  // testing FnAdaptor speed
+  use rand::prelude::*;
+
+  let dn = b"encryption123456";
+  let skp = KeyPair::new();
+
+  const SIZE: usize = 100; // generate a random stream of SIZE in MB
+  let mut plaintext1 = Vec::with_capacity(SIZE * 1024 * 1024);
+  let mut rng = rand::thread_rng();
+  for _ in 0..SIZE {
+    let mut buf = [0u8; 1024 * 1024]; // generate small chunks to avoid explode the stack memory!
+    rng.fill_bytes(&mut buf);
+    plaintext1.extend_from_slice(&buf);
+  }
+  println!("GENERATED: {:?}MB", plaintext1.len()/(1024 * 1024));
+
+  let mut plaintext2 = Vec::new();
+  let mut ciphertext = Vec::new();
+
+  let start = Instant::now();
+  FnAdaptor::save(&skp, dn, plaintext1.as_slice(), &mut ciphertext).unwrap();
+  let save_time = Instant::now() - start;
+  
+  let start = Instant::now();
+  FnAdaptor::load(dn, ciphertext.as_slice(), &mut plaintext2).unwrap();
+  let load_time = Instant::now() - start;
+
+  assert!(plaintext1 == plaintext2);
+
+  let save_speed = (1000 * SIZE as u128)/save_time.as_millis();
+  let load_speed = (1000 * SIZE as u128)/load_time.as_millis();
+  println!("SPEED: (save={:?}MB/s, load={:?}MB/s)", save_speed, load_speed);
 }

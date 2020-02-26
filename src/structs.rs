@@ -307,35 +307,25 @@ impl<R: Read> Read for ReadUntil<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut total = 0usize;
         while total != buf.len() {
-            let mut slice = &mut self.buffer[self.end..];
-            self.end += self.from.read(&mut slice)?;
+            self.end += self.from.read(&mut self.buffer[self.end..])?;
             if self.end < self.remainder {
                 use std::io::{Error, ErrorKind};
                 return Err(Error::new(ErrorKind::InvalidInput, format!("Expected input size of at least {}", self.remainder)));
             }
 
             let top = self.end - self.remainder;
-            if top == 0 {
-                break;
-            }
+            if top == 0 { break; }
             
             let left = buf.len() - total;
-            let moved = if top <= left {
-                let slice = &mut buf[total..(total + top)];
-                slice.copy_from_slice(&self.buffer[..top]);
-                top
-            } else {
-                let slice = &mut buf[total..];
-                slice.copy_from_slice(&self.buffer[..left]);
-                left
-            };
+            let moved = if top <= left { top } else { left };
 
-            // FIX: rotate_left is not efficient - should only copy [0..moved]
+            let slice = &mut buf[total..(total + moved)];
+            slice.copy_from_slice(&self.buffer[..moved]);
+
+            // FIX: rotate_left is not efficient - should only copy [moved..self.end]
             self.buffer.rotate_left(moved);
-            /*{
-                let (left, right) = self.buffer.split_at_mut(moved);
-                left.copy_from_slice(&right[..top]);
-            }*/
+            //self.buffer.drain(..moved);
+            //self.buffer.extend_from_slice(&[0u8; moved]);
             
             self.end -= moved;
             total += moved;
@@ -351,7 +341,7 @@ impl<R: Read> ReadUntil<R> {
     }
 
     pub fn remainder(&self) -> &[u8] {
-        &self.buffer[(self.end - self.remainder)..self.end]
+        &self.buffer[..self.end]
     }
 }
 
@@ -373,7 +363,7 @@ impl FnAdaptor {
         let sig = ExtSignature::sign(&keyp.s, keyp.key.clone(), dhash.as_slice());
         
         // write signature
-        let b_sig = bincode::serialize(&sig)?;
+        let b_sig = bincode::serialize(&sig)?; // NOTE: bincode::serialize(&sig) results in 136 bytes!
         to.write_all(&b_sig)?;
 
         Ok(())

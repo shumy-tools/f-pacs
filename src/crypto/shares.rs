@@ -1,7 +1,6 @@
 use std::fmt::{Debug, Formatter};
 
 use core::ops::{Add, Mul, Sub};
-use rand_os::OsRng;
 use clear_on_drop::clear::Clear;
 
 use serde::{Serialize, Deserialize};
@@ -9,7 +8,7 @@ use serde::{Serialize, Deserialize};
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 
-use crate::crypto::KeyEncoder;
+use crate::crypto::{rnd_scalar, KeyEncoder};
 
 //-----------------------------------------------------------------------------------------------------------
 // Scalar Share
@@ -253,9 +252,7 @@ impl<'a, 'b> Mul<&'b RistrettoPoint> for &'a Polynomial {
 impl Polynomial {
     pub fn rnd(mut secret: Scalar, degree: usize) -> Self {
         let mut coefs = vec![secret];
-
-        let mut csprng: OsRng = OsRng::new().unwrap();
-        let rnd_coefs: Vec<Scalar> = (0..degree).map(|_| Scalar::random(&mut csprng)).collect();
+        let rnd_coefs: Vec<Scalar> = (0..degree).map(|_| rnd_scalar()).collect();
         coefs.extend(rnd_coefs);
         
         // clear secret before drop

@@ -12,8 +12,8 @@ pub mod signatures;
 pub const G: RistrettoPoint = RISTRETTO_BASEPOINT_POINT;
 
 pub fn rnd_scalar() -> Scalar {
-    let mut csprng: OsRng = OsRng::new().unwrap();
-    Scalar::random(&mut csprng)
+    let mut rng = OsRng::new().unwrap();
+    Scalar::random(&mut rng)
 }
 
 pub struct KeyPair {
