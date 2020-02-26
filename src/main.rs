@@ -51,7 +51,7 @@ fn main() {
   let dn = b"encryption123456";
   let skp = KeyPair::new();
 
-  const SIZE: usize = 100; // generate a random stream of SIZE in MB
+  const SIZE: usize = 500; // generate a random stream of SIZE in MB
   let mut plaintext1 = Vec::with_capacity(SIZE * 1024 * 1024);
   let mut rng = rand::thread_rng();
   for _ in 0..SIZE {
@@ -67,14 +67,12 @@ fn main() {
   let start = Instant::now();
   FnAdaptor::save(&skp, dn, plaintext1.as_slice(), &mut ciphertext).unwrap();
   let save_time = Instant::now() - start;
+  println!("SAVE: {:?}MB/s", (1000 * SIZE as u128)/save_time.as_millis());
   
   let start = Instant::now();
   FnAdaptor::load(dn, ciphertext.as_slice(), &mut plaintext2).unwrap();
   let load_time = Instant::now() - start;
+  println!("LOAD: {:?}MB/s", (1000 * SIZE as u128)/load_time.as_millis());
 
   assert!(plaintext1 == plaintext2);
-
-  let save_speed = (1000 * SIZE as u128)/save_time.as_millis();
-  let load_speed = (1000 * SIZE as u128)/load_time.as_millis();
-  println!("SPEED: (save={:?}MB/s, load={:?}MB/s)", save_speed, load_speed);
 }

@@ -1,14 +1,15 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
-use sha2::{Sha256, Digest};
+use sha2::{Sha512, Digest};
 use serde::{Serialize, Deserialize};
 
 use curve25519_dalek::ristretto::{RistrettoPoint, CompressedRistretto};
 
 use std::io::{Read, Write};
 
-use crypto::aessafe::{AesSafe128Encryptor, AesSafe128Decryptor};
+use crypto::aes::KeySize;
+use crypto::aesni::{AesNiEncryptor, AesNiDecryptor};
 use aesstream::{AesWriter, AesReader};
 
 use crate::crypto::*;
@@ -30,7 +31,7 @@ pub struct LambdaKey {
 
 impl LambdaKey {
     pub fn new(alpha: &CompressedRistretto, id: &str, set: &str) -> Self {
-        let key = Sha256::new()
+        let key = Sha512::new()
             .chain(alpha.as_bytes())
             .chain(id)
             .chain(set)
@@ -144,7 +145,7 @@ impl RnEncData {
         // E_{lambda} [kn_prev, dn, hfile]
         let mut data = Vec::new();
         {
-            let encryptor = AesSafe128Encryptor::new(lambda.k128());
+            let encryptor = AesNiEncryptor::new(KeySize::KeySize128, lambda.k128());
             let mut writer = AesWriter::new(&mut data, encryptor).unwrap();
             let b_cd = bincode::serialize(cd).unwrap();
             writer.write_all(&b_cd).unwrap();
@@ -157,7 +158,7 @@ impl RnEncData {
         // D_{lambda} [kn_prev, dn, hfile]
         let mut data = Vec::new();
         {
-            let decryptor = AesSafe128Decryptor::new(lambda.k128());
+            let decryptor = AesNiDecryptor::new(KeySize::KeySize128, lambda.k128());
             let mut reader = AesReader::new(self.data.as_slice(), decryptor)?;
             reader.read_to_end(&mut data)?;
         }
@@ -192,7 +193,7 @@ impl Rn {
 
     pub fn head(keyp: &KeyPair, ekey: &RistrettoPoint, id: &str, set: &str, rd: RnData) -> (LambdaKey, Self) {
         let (lambda, data) = RnEncData::new(ekey, id, set, &rd);
-        let dhash = Sha256::new()
+        let dhash = Sha512::new()
             .chain(id)
             .chain(set)
             .chain(data.to_vec())
@@ -204,7 +205,7 @@ impl Rn {
 
     pub fn tail(keyp: &KeyPair, ekey: &RistrettoPoint, hprev: &[u8], id: &str, set: &str, rd: RnData) -> (LambdaKey, Self) {
         let (lambda, data) = RnEncData::new(ekey, id, set, &rd);
-        let dhash = Sha256::new()
+        let dhash = Sha512::new()
             .chain(hprev)
             .chain(data.to_vec())
             .result();
@@ -224,12 +225,12 @@ impl Rn {
 
     pub fn hash(&self) -> Vec<u8> {
         let dhash = match self.id {
-            Some(_) => Sha256::new()
+            Some(_) => Sha512::new()
                 .chain(self.id.as_ref().unwrap())
                 .chain(self.set.as_ref().unwrap())
                 .chain(self.data.to_vec())
                 .result(),
-            None => Sha256::new()
+            None => Sha512::new()
                 .chain(self.hprev.as_ref().unwrap())
                 .chain(self.data.to_vec())
                 .result()
@@ -242,155 +243,36 @@ impl Rn {
 //-----------------------------------------------------------------------------------------------------------
 // FnAdaptor (read/write)
 //-----------------------------------------------------------------------------------------------------------
-/*fn copy_until<R: Read, W: Write>(mut from: R, mut to: W, reminder: &mut [u8]) -> std::io::Result<u64> {
-    const BUF_SIZE: usize = 1024*1024;
-    let size = reminder.len();
-
-    // double buffer reader
-    let mut total = 064;
-    let mut back_as_data = true;
-    let mut buf1 = [0u8; BUF_SIZE];
-    let mut buf2 = [0u8; BUF_SIZE];
-    let mut front = buf1.as_ref();
-    let mut back = buf2.as_ref();
-    loop {
-        if back_as_data {
-            total += 
-            to.write(back)?;
-        }
-
-        let size = from.read(&mut front)?;
-        if size == 1024*1024 { // continue
-            std::mem::swap(&mut front, &mut back);
-            back_as_data = true;
-        } else { // last data block
-            to.write_all(&front[..size]);
-            break;
-        }
-    }
-
-    // grab signature data!
-    let b_sig = [0u8; SIG_SIZE];
-    back.chain(front).iter().rev().take(SIG_SIZE);
-    Ok(total)
-}*/
-
-pub struct WriteInterceptor<W: Write, F: FnMut(&[u8]) -> ()>(W, F);
-impl<W: Write, F: FnMut(&[u8]) -> ()> Write for WriteInterceptor<W, F> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        (self.1)(buf);
-        self.0.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-pub struct ReadInterceptor<R: Read, F: FnMut(&[u8]) -> ()>(R, F);
-impl<R: Read, F: FnMut(&[u8]) -> ()> Read for ReadInterceptor<R, F> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let size = self.0.read(buf)?;
-        (self.1)(&buf[..size]);
-        Ok(size)
-    }
-}
-
-pub struct ReadUntil<R: Read>{
-    from: R,
-    buffer: Vec<u8>,
-    remainder: usize,
-    end: usize
-}
-
-impl<R: Read> Read for ReadUntil<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut total = 0usize;
-        while total != buf.len() {
-            self.end += self.from.read(&mut self.buffer[self.end..])?;
-            if self.end < self.remainder {
-                use std::io::{Error, ErrorKind};
-                return Err(Error::new(ErrorKind::InvalidInput, format!("Expected input size of at least {}", self.remainder)));
-            }
-
-            let top = self.end - self.remainder;
-            if top == 0 { break; }
-            
-            let left = buf.len() - total;
-            let moved = if top <= left { top } else { left };
-
-            let slice = &mut buf[total..(total + moved)];
-            slice.copy_from_slice(&self.buffer[..moved]);
-
-            // FIX: rotate_left is not efficient - should only copy [moved..self.end]
-            self.buffer.rotate_left(moved);
-            //self.buffer.drain(..moved);
-            //self.buffer.extend_from_slice(&[0u8; moved]);
-            
-            self.end -= moved;
-            total += moved;
-        }
-        
-        Ok(total)
-    }
-}
-
-impl<R: Read> ReadUntil<R> {
-    pub fn new(from: R, remainder: usize) -> Self {
-        Self { from, buffer: vec![0u8; 1024 + remainder], remainder, end: 0 }
-    }
-
-    pub fn remainder(&self) -> &[u8] {
-        &self.buffer[..self.end]
-    }
-}
-
 pub struct FnAdaptor;
 impl FnAdaptor {
     pub fn save<R: Read, W: Write>(keyp: &KeyPair, dn: &[u8; 16], mut from: R, mut to: W) -> Result<()> {
-        let mut hasher = Sha256::new();
-        let encryptor = AesSafe128Encryptor::new(dn);
+        let encryptor = AesNiEncryptor::new(KeySize::KeySize128, dn);
+        let mut writer = AesWriter::new(&mut to, encryptor)?;
 
-        // write and hash ciphertext
-        {// from(plaintext) -> writer -> interceptor -> to(ciphertext)
-            let mut interceptor = WriteInterceptor(&mut to, |buf| hasher.input(buf));
-            let mut writer = AesWriter::new(&mut interceptor, encryptor)?;
-            std::io::copy(&mut from, &mut writer)?;
-        };
+        // construct and write signature
+        let sig = ExtSignature::sign(&keyp.s, keyp.key.clone(), dn);
+        let b_sig = bincode::serialize(&sig)?;
+        writer.write_all(&b_sig)?;
 
-        // construct signature
-        let dhash = hasher.result();
-        let sig = ExtSignature::sign(&keyp.s, keyp.key.clone(), dhash.as_slice());
-        
-        // write signature
-        let b_sig = bincode::serialize(&sig)?; // NOTE: bincode::serialize(&sig) results in 136 bytes!
-        to.write_all(&b_sig)?;
-
+        // encrypt data 
+        std::io::copy(&mut from, &mut writer)?;
         Ok(())
     }
 
     pub fn load<R: Read, W: Write>(dn: &[u8; 16], mut from: R, mut to: W) -> Result<()> {
-        let mut hasher = Sha256::new();
-        let decryptor = AesSafe128Decryptor::new(dn);
-        let mut encrypted = ReadUntil::new(&mut from, 136); // NOTE: bincode::serialize(&sig) results in 136 bytes!
+        let decryptor = AesNiDecryptor::new(KeySize::KeySize128, dn);
+        let mut reader = AesReader::new(&mut from, decryptor)?;
 
-        // read and hash ciphertext
-        {// from(ciphertext) -> interceptor -> reader -> to(plaintext)
-            let mut interceptor = ReadInterceptor(&mut encrypted, |buf| hasher.input(buf));
-            let mut reader = AesReader::new(&mut interceptor, decryptor)?;
-            std::io::copy(&mut reader, &mut to)?;
-        };
-
-        // read signature
-        let b_sig = encrypted.remainder();
-        let sig: ExtSignature = bincode::deserialize(b_sig)?;
-
-        // verify signature
-        let dhash = hasher.result();
-        if !sig.verify(&dhash) {
+        // read and validate signature
+        let mut b_sig = [0u8; 136]; // NOTE: bincode size for ExtSignature
+        reader.read(&mut b_sig)?;
+        let sig: ExtSignature = bincode::deserialize(&b_sig)?;
+        if !sig.verify(dn) {
             Err("Signature verification failed!")?
         }
 
+        // dencrypt data
+        std::io::copy(&mut reader, &mut to)?;
         Ok(())
     }
 }
